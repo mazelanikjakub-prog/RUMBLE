@@ -94,7 +94,7 @@ int main(void)
   MX_USART2_UART_Init();
   MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
-HAL_TIM_PWM_Start(&htim2 , TIM_CHANNEL_1);
+HAL_TIM_PWM_Start(&htim2 , TIM_CHANNEL_1);  /* JAKUB's pwm timer channels for wheels (need both) */
 HAL_TIM_PWM_Start(&htim2 , TIM_CHANNEL_2);
 
   /* USER CODE END 2 */
@@ -256,7 +256,7 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOA, LD2_Pin|h_bridge_IN1_Pin|h_bridge_IN2_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin : B1_Pin */
   GPIO_InitStruct.Pin = B1_Pin;
@@ -264,12 +264,19 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : LD2_Pin */
-  GPIO_InitStruct.Pin = LD2_Pin;
+  /*Configure GPIO pins : LD2_Pin h_bridge_IN2_Pin */
+  GPIO_InitStruct.Pin = LD2_Pin|h_bridge_IN2_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(LD2_GPIO_Port, &GPIO_InitStruct);
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : h_bridge_IN1_Pin */
+  GPIO_InitStruct.Pin = h_bridge_IN1_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_MEDIUM;
+  HAL_GPIO_Init(h_bridge_IN1_GPIO_Port, &GPIO_InitStruct);
 
   /* EXTI interrupt init*/
   HAL_NVIC_SetPriority(EXTI15_10_IRQn, 0, 0);
@@ -280,9 +287,39 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin){
+
+
+void SetLeftWheel(int x){    /* JAKUB's wheel speed function */
+	if (x>=0){
+		HAL_GPIO_WritePin(GPIOA , GPIO_PIN_6 , GPIO_PIN_SET);
+		HAL_GPIO_WritePin(GPIOA , GPIO_PIN_7 , GPIO_PIN_RESET);
+
+	}
+	else if (x<0){
+		x = -x;
+		HAL_GPIO_WritePin(GPIOA , GPIO_PIN_6 , GPIO_PIN_RESET);
+		HAL_GPIO_WritePin(GPIOA , GPIO_PIN_7 , GPIO_PIN_SET);
+
+	}
+	else {
+		HAL_GPIO_WritePin(GPIOA , GPIO_PIN_6 , GPIO_PIN_RESET);
+		HAL_GPIO_WritePin(GPIOA , GPIO_PIN_7 , GPIO_PIN_RESET);
+	}
+	__HAL_TIM_SET_COMPARE(&htim2 ,TIM_CHANNEL_1 , x* __HAL_TIM_GET_AUTORELOAD(&htim2)/100);
+
+}
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin){  /*test for wheelspeed change */
+	static int i = -3 ;
 	if (GPIO_Pin == GPIO_PIN_13){
-		__HAL_TIM_SET_COMPARE(&htim2 , TIM_CHANNEL_1 , __HAL_TIM_GET_AUTORELOAD(&htim2 )/2);
+		if (i <= 2){
+			SetLeftWheel(i*30);
+			i++;
+		}
+		else{
+			SetLeftWheel(i*30);
+			i = -3;
+		}
+
 	}
 }
 
