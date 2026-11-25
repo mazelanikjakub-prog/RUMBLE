@@ -3,3 +3,9 @@ Release/
 .settings/
 *.launch
 
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/

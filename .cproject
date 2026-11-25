@@ -159,14 +159,7 @@
 		<project id="RUMBLE.null.1247640071" name="RUMBLE"/>
 	</storageModule>
 	<storageModule moduleId="org.eclipse.cdt.core.LanguageSettingsProviders"/>
-	<storageModule moduleId="scannerConfiguration">
-		<autodiscovery enabled="true" problemReportingEnabled="true" selectedProfileId=""/>
-		<scannerConfigBuildInfo instanceId="com.st.stm32cube.ide.mcu.gnu.managedbuild.config.exe.debug.741304235;com.st.stm32cube.ide.mcu.gnu.managedbuild.config.exe.debug.741304235.;com.st.stm32cube.ide.mcu.gnu.managedbuild.tool.c.compiler.964788631;com.st.stm32cube.ide.mcu.gnu.managedbuild.tool.c.compiler.input.c.1232172335">
-			<autodiscovery enabled="false" problemReportingEnabled="true" selectedProfileId=""/>
-		</scannerConfigBuildInfo>
-		<scannerConfigBuildInfo instanceId="com.st.stm32cube.ide.mcu.gnu.managedbuild.config.exe.release.1532718037;com.st.stm32cube.ide.mcu.gnu.managedbuild.config.exe.release.1532718037.;com.st.stm32cube.ide.mcu.gnu.managedbuild.tool.c.compiler.1331414035;com.st.stm32cube.ide.mcu.gnu.managedbuild.tool.c.compiler.input.c.160294744">
-			<autodiscovery enabled="false" problemReportingEnabled="true" selectedProfileId=""/>
-		</scannerConfigBuildInfo>
-	</storageModule>
 	<storageModule moduleId="refreshScope"/>
+	<storageModule moduleId="org.eclipse.cdt.make.core.buildtargets"/>
+	<storageModule moduleId="scannerConfiguration"/>
 </cproject>
