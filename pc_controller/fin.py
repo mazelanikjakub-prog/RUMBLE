@@ -1,14 +1,13 @@
 """Gamepad -> car controller over Bluetooth serial (COM8 @ 9600 baud), no window.
 
 Controls (Xbox pad):
-  RT / LT        forward / backward (throttle)
-  left stick X   steering
+  left stick     Y = forward/back, X = left/right (sent raw, the car does the mixing)
   A              horn (buzzer on the car while held)
   B              emergency stop (all motors 0)
 The gamepad rumbles while the car reports an obstacle closer than 20 cm ("CLOSE").
 
-Packet sent to the car (6 bytes):  'y' <right motor>  'x' <left motor>  'h' <A button>
-Motor speeds are -127..127, encoded as one byte by encode_axis().
+Packet sent to the car (6 bytes):  'y' <stick Y>  'x' <stick X>  'h' <A button>
+Stick values are -127..127 (Y: forward +, X: right +), encoded as one byte by encode_axis().
 """
 
 import os
@@ -190,23 +189,17 @@ def main() -> None:
                 a_changed = btn_a != cur_a
                 cur_a = btn_a
 
+                # Left stick, raw (only a dead zone): X = axis 0, Y = axis 1.
+                # pygame gives Y = -1 when the stick is pushed forward, so flip it: forward = +127.
+                # The STM32 turns (Y, X) into left/right motor speeds.
                 n = joy.get_numaxes()
                 raw_x = joy.get_axis(0) if n >= 1 else 0.0
-                raw_lt = joy.get_axis(4) if n >= 5 else -1.0
-                raw_rt = joy.get_axis(5) if n >= 6 else -1.0
-                lt_seen = lt_seen or abs(raw_lt) > 1e-4
-                rt_seen = rt_seen or abs(raw_rt) > 1e-4
-                lt = apply_trigger_deadzone(raw_lt) if lt_seen else 0.0
-                rt = apply_trigger_deadzone(raw_rt) if rt_seen else 0.0
-
-                # Mix throttle and steering into left/right motor speeds (tank-style drive),
-                # scale down so neither exceeds 1, then to -127..127. Sent as (right, left) = (y, x).
-                throttle, steer = rt - lt, apply_deadzone(raw_x)
-                left_m, right_m = throttle + steer, throttle - steer
-                scale = max(1.0, abs(left_m), abs(right_m))
+                raw_y = joy.get_axis(1) if n >= 2 else 0.0
+                stick_x = apply_deadzone(raw_x)    # right = +
+                stick_y = -apply_deadzone(raw_y)   # forward = +
                 new_axes = (
-                    max(-127, min(127, int(round((right_m / scale) * 127)))),
-                    max(-127, min(127, int(round((left_m / scale) * 127)))),
+                    max(-127, min(127, int(round(stick_y * 127)))),
+                    max(-127, min(127, int(round(stick_x * 127)))),
                 )
                 axes_changed = new_axes != last_axes
                 last_axes = new_axes

@@ -58,12 +58,16 @@ UART_HandleTypeDef huart2;
  * The PC (pc_controller/fin.py) sends a 6-byte packet over Bluetooth (USART1, 9600 baud)
  * every time the gamepad changes:
  *
- *     'y' <right motor>  'x' <left motor>  'h' <horn>
- *     0x79   byte 1      0x78   byte 3     0x68  byte 5
+ *     'y' <stick Y>  'x' <stick X>  'h' <horn>
+ *     0x79  byte 1   0x78  byte 3   0x68  byte 5
  *
- * Motor bytes are speeds -127..127 (the PC already mixed throttle + steering):
- *     0..127   -> forward,  speed = value
- *     128..254 -> backward, speed = value - 127   (so 128 = -1, 254 = -127)
+ * Y and X are the raw left stick of the gamepad, -127..127 (Y: forward = +, X: right = +):
+ *     0..127   -> positive, value as is
+ *     128..254 -> negative, -(value - 127)   (so 128 = -1, 254 = -127)
+ *
+ * TODO (drive): the code below still sends y straight to the right motor and x to the
+ * left motor (from when the PC did the mixing). Mix stick Y/X into left/right motor
+ * speeds here before calling Set_Channel_A/B (arcade drive).
  * Horn byte: 1 while the gamepad A button is held, else 0.
  *
  * Everything runs in interrupt callbacks (bottom of this file):
@@ -75,8 +79,8 @@ UART_HandleTypeDef huart2;
  */
 
 /* Values from the last Bluetooth packet (written in the USART1 interrupt) */
-volatile int y = 0;          // right motor speed, -127..127 (sign = direction)
-volatile int x = 0;          // left motor speed,  -127..127
+volatile int y = 0;          // left stick Y, -127..127 (forward = +)
+volatile int x = 0;          // left stick X, -127..127 (right = +)
 volatile int h = 0;          // horn: 1 = A button held -> buzzer on
 uint8_t bt_byte[64];         // receive buffer for the Bluetooth UART
 
@@ -811,10 +815,11 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 			h = bt_byte[5];
 		}
 
+		// TODO (drive): mix y/x into right/left motor speeds first (see overview at the top)
 		Set_Channel_A(y);
 		Set_Channel_B(x);
 
-		// Reversing = both motors get a negative speed
+		// Reversing = both motors get a negative speed (TODO: use the mixed motor speeds here)
 		uint8_t new_reversing = (y < 0 && x < 0) ? 1 : 0;
 		if (new_reversing && !is_reversing)
 		{

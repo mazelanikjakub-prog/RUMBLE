@@ -22,6 +22,6 @@ Bluetooth serial link (HC-05 style SPP, 9600 baud).
 
 6 bytes per command: `0x79 Y 0x78 X 0x68 A`
 
-- `Y`, `X`: axis -127..127; negative values are sent as `127 + |value|`
+- `Y`, `X`: raw left stick, -127..127 (Y forward = +, X right = +); negative values are sent as `127 + |value|`
 - `A`: 1 while the A button is held, else 0
 - `79 00 78 00 68 00` = stop
