@@ -233,14 +233,10 @@ int main(void)
 			new_dist_ready = 0;
 			if (huart1.gState == HAL_UART_STATE_READY)
 			{
-			  if (distance > 0 && distance < 20)
-			  {
-				HAL_UART_Transmit_IT(&huart1, (uint8_t*)"CLOSE\n", 6);
-			  }
-			  else
-			  {
-				HAL_UART_Transmit_IT(&huart1, (uint8_t*)"CLEAR\n", 6);
-			  }
+			  static uint8_t is_close = 0;   // hysteresis: CLOSE below 20 cm, CLEAR only above 25 cm
+			  if (!is_close && distance > 0 && distance < 20) is_close = 1;
+			  else if (is_close && distance > 25)             is_close = 0;
+			  HAL_UART_Transmit_IT(&huart1, (uint8_t*)(is_close ? "CLOSE\n" : "CLEAR\n"), 6);
 			}
 		  }
 
@@ -329,7 +325,7 @@ static void MX_TIM2_Init(void)
   sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_BOTHEDGE;
   sConfigIC.ICSelection = TIM_ICSELECTION_DIRECTTI;
   sConfigIC.ICPrescaler = TIM_ICPSC_DIV1;
-  sConfigIC.ICFilter = 0;
+  sConfigIC.ICFilter = 10;
   if (HAL_TIM_IC_ConfigChannel(&htim2, &sConfigIC, TIM_CHANNEL_1) != HAL_OK)
   {
     Error_Handler();
@@ -698,36 +694,26 @@ void HAL_TIM_OC_DelayElapsedCallback(TIM_HandleTypeDef *htim)
   }
 }
 
-/* TIM2 input capture on the HC-SR04 echo pin: first call = rising edge, second = falling edge.
+/* TIM2 input capture on the HC-SR04 echo pin (both edges, 1 tick = 1 us).
+ * The pin level tells which edge it was, so a noise spike can never swap rising/falling.
  * Pulse width in us / 58 = distance in cm. */
 void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
 {
   if (htim->Instance == TIM2 && htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1)
   {
-    if (edge_flag == 0)
+    uint32_t t = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1);
+
+    if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0) == GPIO_PIN_SET)  // rising edge: echo starts
     {
-      t_start = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1);
+      t_start = t;
       edge_flag = 1;
     }
-    else
+    else if (edge_flag)                                        // falling edge: echo ends
     {
-      t_stop = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1);
+      t_stop = t;
       edge_flag = 0;
-
-      if (t_stop >= t_start)
-      {
-        echo_width = t_stop - t_start;
-      }
-      else
-      {
-        echo_width = (htim->Instance->ARR - t_start) + t_stop;
-      }
-
-      distance = echo_width / 58;
-
-      // (unused: this message is built but never sent; the duplicate line below is also leftover)
-      char dist_msg[64];
-      int len = snprintf(dist_msg, sizeof(dist_msg), "Distance: %lu cm\r\n", distance);
+      echo_width = (t_stop >= t_start) ? (t_stop - t_start)
+                                       : (htim->Instance->ARR + 1 - t_start + t_stop);
       distance = echo_width / 58;
       new_dist_ready = 1;
     }
