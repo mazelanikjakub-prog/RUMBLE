@@ -65,9 +65,8 @@ UART_HandleTypeDef huart2;
  *     0..127   -> positive, value as is
  *     128..254 -> negative, -(value - 127)   (so 128 = -1, 254 = -127)
  *
- * TODO (drive): the code below still sends y straight to the right motor and x to the
- * left motor (from when the PC did the mixing). Mix stick Y/X into left/right motor
- * speeds here before calling Set_Channel_A/B (arcade drive).
+ * Drive (arcade mixing, in the USART1 callback):  left = Y + X,  right = Y - X,
+ * each clamped to -127..127; stick inside a small circle around the centre = stop.
  * Horn byte: 1 while the gamepad A button is held, else 0.
  *
  * Everything runs in interrupt callbacks (bottom of this file):
@@ -112,8 +111,8 @@ static void MX_TIM4_Init(void);
 static void MX_TIM5_Init(void);
 static void MX_TIM10_Init(void);
 /* USER CODE BEGIN PFP */
-void Set_Channel_A(int val);   // right motor (H-bridge IN1/IN2, PWM on TIM3 CH1)
-void Set_Channel_B(int val);   // left motor  (H-bridge IN3/IN4, PWM on TIM3 CH2)
+void SetSpeedRight(int speed);  // right wheel, -127..127 (H-bridge IN1/IN2, PWM on TIM3 CH1)
+void SetSpeedLeft(int speed);   // left wheel,  -127..127 (H-bridge IN3/IN4, PWM on TIM3 CH2)
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -720,51 +719,57 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
   }
 }
 
-/* Right motor. val > 0 forward, val < 0 backward, 0 stop.
- * IN1/IN2 set the H-bridge direction, |val| is the PWM compare value (0..127 = 0..100%). */
-void Set_Channel_A(int val)
+/* Clamp a motor speed to the PWM range -127..127 (TIM3 Period = 126 -> CCR 127 = 100%). */
+static int Clamp_Speed(int speed)
 {
-	if (val > 0)
+	if (speed > 127)  return 127;
+	if (speed < -127) return -127;
+	return speed;
+}
+
+/* Right wheel. speed > 0 forward, < 0 backward, 0 stop (coast).
+ * IN1/IN2 (PA8/PB3) set the H-bridge direction, |speed| is the PWM on TIM3 CH1 (PA6). */
+void SetSpeedRight(int speed)
+{
+	speed = Clamp_Speed(speed);
+	if (speed > 0)
 	{
 		HAL_GPIO_WritePin(IN1_GPIO_Port, IN1_Pin, GPIO_PIN_SET);
 		HAL_GPIO_WritePin(IN2_GPIO_Port, IN2_Pin, GPIO_PIN_RESET);
-		__HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, val);
 	}
-	else if (val < 0)
+	else if (speed < 0)
 	{
 		HAL_GPIO_WritePin(IN1_GPIO_Port, IN1_Pin, GPIO_PIN_RESET);
 		HAL_GPIO_WritePin(IN2_GPIO_Port, IN2_Pin, GPIO_PIN_SET);
-		__HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, abs(val));
 	}
 	else
 	{
 		HAL_GPIO_WritePin(IN1_GPIO_Port, IN1_Pin, GPIO_PIN_RESET);
 		HAL_GPIO_WritePin(IN2_GPIO_Port, IN2_Pin, GPIO_PIN_RESET);
-		__HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 0);
 	}
+	__HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, abs(speed));
 }
 
-/* Left motor, same as Set_Channel_A but IN3/IN4 and TIM3 CH2. */
-void Set_Channel_B(int val)
+/* Left wheel. Same as SetSpeedRight, but IN3/IN4 (PB5/PB4) and TIM3 CH2 (PA7). */
+void SetSpeedLeft(int speed)
 {
-	if (val > 0)
+	speed = Clamp_Speed(speed);
+	if (speed > 0)
 	{
 		HAL_GPIO_WritePin(IN3_GPIO_Port, IN3_Pin, GPIO_PIN_SET);
 		HAL_GPIO_WritePin(IN4_GPIO_Port, IN4_Pin, GPIO_PIN_RESET);
-		__HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, val);
 	}
-	else if (val < 0)
+	else if (speed < 0)
 	{
 		HAL_GPIO_WritePin(IN3_GPIO_Port, IN3_Pin, GPIO_PIN_RESET);
 		HAL_GPIO_WritePin(IN4_GPIO_Port, IN4_Pin, GPIO_PIN_SET);
-		__HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, abs(val));
 	}
 	else
 	{
 		HAL_GPIO_WritePin(IN3_GPIO_Port, IN3_Pin, GPIO_PIN_RESET);
 		HAL_GPIO_WritePin(IN4_GPIO_Port, IN4_Pin, GPIO_PIN_RESET);
-		__HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 0);
 	}
+	__HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, abs(speed));
 }
 
 /* USART1 (Bluetooth): a packet has arrived (line went idle). Size = number of bytes received.
@@ -801,12 +806,19 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 			h = bt_byte[5];
 		}
 
-		// TODO (drive): mix y/x into right/left motor speeds first (see overview at the top)
-		Set_Channel_A(y);
-		Set_Channel_B(x);
+		// Arcade drive: stick Y = forward/back, stick X = turn.
+		// Pushing right (X > 0) speeds up the left wheel and slows the right one -> turns right.
+		int left = 0, right = 0;
+		if (x * x + y * y >= 25)          // dead zone: stick within radius 5 of the centre = stop
+		{
+			left  = Clamp_Speed(y + x);
+			right = Clamp_Speed(y - x);
+		}
+		SetSpeedRight(right);
+		SetSpeedLeft(left);
 
-		// Reversing = both motors get a negative speed (TODO: use the mixed motor speeds here)
-		uint8_t new_reversing = (y < 0 && x < 0) ? 1 : 0;
+		// Reversing = both wheels turn backwards
+		uint8_t new_reversing = (left < 0 && right < 0) ? 1 : 0;
 		if (new_reversing && !is_reversing)
 		{
 			// Reversing just started: lights and buzzer on immediately for the first period
