@@ -52,23 +52,49 @@ UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
-volatile int y = 0;
-volatile int x = 0;
-volatile int h = 0;
-uint8_t bt_byte[64];
+/*
+ * How the car works (overview)
+ * ----------------------------
+ * The PC (pc_controller/fin.py) sends a 6-byte packet over Bluetooth (USART1, 9600 baud)
+ * every time the gamepad changes:
+ *
+ *     'y' <right motor>  'x' <left motor>  'h' <horn>
+ *     0x79   byte 1      0x78   byte 3     0x68  byte 5
+ *
+ * Motor bytes are speeds -127..127 (the PC already mixed throttle + steering):
+ *     0..127   -> forward,  speed = value
+ *     128..254 -> backward, speed = value - 127   (so 128 = -1, 254 = -127)
+ * Horn byte: 1 while the gamepad A button is held, else 0.
+ *
+ * Everything runs in interrupt callbacks (bottom of this file):
+ *   USART1 RX  -> decode packet, set motor PWM (TIM3), reverse lights + buzzer
+ *   TIM4 (300 ms) -> trigger the HC-SR04 distance sensor, blink while reversing
+ *   TIM5 (10 us)  -> end the sensor trigger pulse
+ *   TIM2 capture  -> measure the echo pulse width = distance
+ * The main while(1) loop only sends debug/status text and sleeps (__WFI).
+ */
 
-volatile uint8_t new_dist_ready = 0;
-volatile uint8_t new_bt_ready = 0;
+/* Values from the last Bluetooth packet (written in the USART1 interrupt) */
+volatile int y = 0;          // right motor speed, -127..127 (sign = direction)
+volatile int x = 0;          // left motor speed,  -127..127
+volatile int h = 0;          // horn: 1 = A button held -> buzzer on
+uint8_t bt_byte[64];         // receive buffer for the Bluetooth UART
 
-volatile uint32_t t_start = 0;
-volatile uint32_t t_stop = 0;
-volatile uint8_t  edge_flag = 0;
-volatile uint32_t echo_width = 0;
-volatile uint32_t distance = 999;
+/* Flags: an interrupt sets them to 1, the main loop handles them and clears them */
+volatile uint8_t new_dist_ready = 0;   // a new distance measurement is ready
+volatile uint8_t new_bt_ready = 0;     // a new Bluetooth packet was received
 
-volatile uint8_t is_reversing = 0;
-volatile uint8_t rev_blink_state = 0;
-volatile uint8_t rev_tick_counter = 0;
+/* HC-SR04 ultrasonic distance sensor (echo measured with TIM2 input capture, 1 tick = 1 us) */
+volatile uint32_t t_start = 0;         // timer value at the echo rising edge
+volatile uint32_t t_stop = 0;          // timer value at the echo falling edge
+volatile uint8_t  edge_flag = 0;       // 0 = waiting for rising edge, 1 = waiting for falling edge
+volatile uint32_t echo_width = 0;      // echo pulse length in us
+volatile uint32_t distance = 999;      // distance in cm (echo_width / 58)
+
+/* Reversing: lights (PA9) and buzzer blink while both motors run backwards */
+volatile uint8_t is_reversing = 0;     // 1 = both motor speeds < 0
+volatile uint8_t rev_blink_state = 0;  // 1 = lights/buzzer currently on, toggles every 0.9 s
+volatile uint8_t rev_tick_counter = 0; // counts TIM4 ticks (300 ms each) between toggles
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -82,15 +108,17 @@ static void MX_TIM4_Init(void);
 static void MX_TIM5_Init(void);
 static void MX_TIM10_Init(void);
 /* USER CODE BEGIN PFP */
-void Set_Channel_A(int val);
-void Set_Channel_B(int val);
+void Set_Channel_A(int val);   // right motor (H-bridge IN1/IN2, PWM on TIM3 CH1)
+void Set_Channel_B(int val);   // left motor  (H-bridge IN3/IN4, PWM on TIM3 CH2)
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+/* Sets the reverse lights and the buzzer from the current state (h, is_reversing,
+ * rev_blink_state). Called after every Bluetooth packet and on every blink toggle. */
 static inline void Update_Reverse_And_Buzzer(void)
 {
-  // 1. Diody cofania (REVERSE_Pin): migają 1s ON / 1s OFF tylko gdy oba silniki < 0
+  // 1. Reverse lights (REVERSE_Pin = PA9): blink ~1 s on / ~1 s off, only while both motors < 0
   if (is_reversing && rev_blink_state)
   {
     HAL_GPIO_WritePin(REVERSE_GPIO_Port, REVERSE_Pin, GPIO_PIN_SET);
@@ -100,9 +128,11 @@ static inline void Update_Reverse_And_Buzzer(void)
     HAL_GPIO_WritePin(REVERSE_GPIO_Port, REVERSE_Pin, GPIO_PIN_RESET);
   }
 
-  // 2. Buzzer pasywny (TIM10_CH1):
-  //    - przycisk 'A' (h != 0) -> ciągły dźwięk (wypełnienie 200 z 400 = 50%)
-  //    - cofanie (is_reversing) -> przerywany dźwięk 1s ON / 1s OFF
+  // 2. Passive buzzer on PB8 (TIM10 CH1 PWM, 1 MHz / 400 = 2.5 kHz tone):
+  //    - A button held (h != 0) -> continuous tone
+  //    - reversing              -> tone blinks together with the lights
+  //    NOTE: a passive buzzer needs a square wave. Compare 400 with Period 399 = 100% duty
+  //    (pin always high), which is probably silent. 200 would give 50% duty. Test on the car.
   if (h != 0 || (is_reversing && rev_blink_state))
   {
     __HAL_TIM_SET_COMPARE(&htim10, TIM_CHANNEL_1, 400);
@@ -151,19 +181,22 @@ int main(void)
   MX_TIM5_Init();
   MX_TIM10_Init();
   /* USER CODE BEGIN 2 */
-  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
-  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
+  // Motor PWM: TIM3, 1 MHz tick, Period 126 -> 127 steps, so speed 0..127 maps to 0..100% duty
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);   // right motor
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);   // left motor
 
-  HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_1);
-  HAL_TIM_Base_Start_IT(&htim4);
+  HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_1); // distance sensor echo measurement
+  HAL_TIM_Base_Start_IT(&htim4);              // 300 ms tick: sensor trigger + reverse blinking
 
   HAL_TIM_PWM_Start(&htim10, TIM_CHANNEL_2);
-  HAL_TIM_PWM_Start(&htim10, TIM_CHANNEL_1);
-  __HAL_TIM_SET_COMPARE(&htim10, TIM_CHANNEL_1, 0);
+  HAL_TIM_PWM_Start(&htim10, TIM_CHANNEL_1);  // buzzer
+  __HAL_TIM_SET_COMPARE(&htim10, TIM_CHANNEL_1, 0);   // buzzer off at start
 
-  char start_msg[] = "STM32 gotowy! Czekam na dane z Bluetooth...\r\n";
+  // Debug console on the PC (USART2 = Nucleo USB cable)
+  char start_msg[] = "STM32 ready! Waiting for Bluetooth data...\r\n";
   HAL_UART_Transmit(&huart2, (uint8_t*)start_msg, strlen(start_msg), 100);
 
+  // Start receiving Bluetooth packets; HAL_UARTEx_RxEventCallback runs when a packet has arrived
   HAL_UARTEx_ReceiveToIdle_IT(&huart1, bt_byte, sizeof(bt_byte));
   /* USER CODE END 2 */
 
@@ -174,6 +207,9 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+	  // No control logic here: interrupts do the work and set flags, this loop only sends text.
+
+	  // New Bluetooth packet -> print it on the PC debug console (USART2)
 	  if (new_bt_ready)
 		  {
 			new_bt_ready = 0;
@@ -187,6 +223,7 @@ int main(void)
 			}
 		  }
 
+		  // New distance -> tell the PC over Bluetooth (fin.py rumbles the gamepad on CLOSE)
 		  if (new_dist_ready)
 		  {
 			new_dist_ready = 0;
@@ -625,18 +662,19 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
   if (htim->Instance == TIM4)
   {
-    // 1. Wyzwolenie czujnika HC-SR04 (bez zmian)
+    // 1. Start the HC-SR04 trigger pulse: PA1 high now, TIM5 sets it low again after 10 us
     HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_SET);
     __HAL_TIM_SET_COUNTER(&htim5, 0);
     __HAL_TIM_SET_COMPARE(&htim5, TIM_CHANNEL_2, 10);
     __HAL_TIM_CLEAR_FLAG(&htim5, TIM_FLAG_CC2);
     HAL_TIM_OC_Start_IT(&htim5, TIM_CHANNEL_2);
 
-    // 2. Przełączanie stanu 1s ON / 1s OFF dla cofania (3 x 300ms = 0.9s; przy Period=249: 4 x 250ms = 1.0s)
+    // 2. Reverse blinking: toggle every 3 ticks (3 x 300 ms = 0.9 s).
+    //    For exactly 1 s: set TIM4 Period = 249 (250 ms) and count to 4.
     if (is_reversing)
     {
       rev_tick_counter++;
-      if (rev_tick_counter >= 3) // zmień na 4, jeśli ustawisz TIM4 Period = 249
+      if (rev_tick_counter >= 3) // change to 4 if TIM4 Period = 249
       {
         rev_tick_counter = 0;
         rev_blink_state = !rev_blink_state;
@@ -646,6 +684,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   }
 }
 
+/* TIM5 compare, 10 us after the trigger started: end the HC-SR04 trigger pulse */
 void HAL_TIM_OC_DelayElapsedCallback(TIM_HandleTypeDef *htim)
 {
   if (htim->Instance == TIM5 && htim->Channel == HAL_TIM_ACTIVE_CHANNEL_2)
@@ -655,6 +694,8 @@ void HAL_TIM_OC_DelayElapsedCallback(TIM_HandleTypeDef *htim)
   }
 }
 
+/* TIM2 input capture on the HC-SR04 echo pin: first call = rising edge, second = falling edge.
+ * Pulse width in us / 58 = distance in cm. */
 void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
 {
   if (htim->Instance == TIM2 && htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1)
@@ -680,15 +721,17 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
 
       distance = echo_width / 58;
 
-      // Wypisanie aktualnego dystansu w konsoli PC (USART2)
+      // (unused: this message is built but never sent; the duplicate line below is also leftover)
       char dist_msg[64];
-      int len = snprintf(dist_msg, sizeof(dist_msg), "Dystans: %lu cm\r\n", distance);
+      int len = snprintf(dist_msg, sizeof(dist_msg), "Distance: %lu cm\r\n", distance);
       distance = echo_width / 58;
       new_dist_ready = 1;
     }
   }
 }
 
+/* Right motor. val > 0 forward, val < 0 backward, 0 stop.
+ * IN1/IN2 set the H-bridge direction, |val| is the PWM compare value (0..127 = 0..100%). */
 void Set_Channel_A(int val)
 {
 	if (val > 0)
@@ -711,6 +754,7 @@ void Set_Channel_A(int val)
 	}
 }
 
+/* Left motor, same as Set_Channel_A but IN3/IN4 and TIM3 CH2. */
 void Set_Channel_B(int val)
 {
 	if (val > 0)
@@ -733,12 +777,16 @@ void Set_Channel_B(int val)
 	}
 }
 
+/* USART1 (Bluetooth): a packet has arrived (line went idle). Size = number of bytes received.
+ * Decodes it, drives the motors, updates lights/buzzer, flags the main loop. */
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 {
 	if (huart->Instance == USART1)
 	{
 		char debug_msg[128];
 
+		// Decode the 6-byte packet  'y' R 'x' L 'h' A  (see the overview at the top)
+		// Bytes 128..254 are negative speeds: -(value - 127)
 		if (Size >= 6 && bt_byte[0] == 'y')
 		{
 			y = bt_byte[1];
@@ -757,6 +805,7 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 			}
 		}
 
+		// Horn: 1 while the A button is held
 		if (Size >= 6 && bt_byte[4] == 'h')
 		{
 			h = bt_byte[5];
@@ -765,11 +814,11 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 		Set_Channel_A(y);
 		Set_Channel_B(x);
 
-		// Sprawdź, czy oba silniki dostają wartość poniżej zera (cofanie)
+		// Reversing = both motors get a negative speed
 		uint8_t new_reversing = (y < 0 && x < 0) ? 1 : 0;
 		if (new_reversing && !is_reversing)
 		{
-			// Start cofania: natychmiast zapal LED i włącz dźwięk na pierwszą sekundę
+			// Reversing just started: lights and buzzer on immediately for the first period
 			is_reversing = 1;
 			rev_blink_state = 1;
 			rev_tick_counter = 0;
@@ -785,17 +834,19 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 
 		new_bt_ready = 1;
 
-		// Wypisanie czytelnego tekstu na konsole USB (USART2)
+		// Readable debug text for the USB console (USART2) - currently disabled, the main loop prints instead
 		int len = snprintf(debug_msg, sizeof(debug_msg),
-				"Odebrano (%d B): [%02X %02X %02X %02X %02X %02X] -> Y=%d, X=%d\r\n",
+				"Received (%d B): [%02X %02X %02X %02X %02X %02X] -> Y=%d, X=%d\r\n",
 				Size, bt_byte[0], bt_byte[1], bt_byte[2], bt_byte[3], bt_byte[4], bt_byte[5], y, x);
 		//HAL_UART_Transmit(&huart2, (uint8_t*)debug_msg, len, 100);
+		// Clear UART error flags (overrun, noise, framing) and start receiving the next packet
 		__HAL_UART_CLEAR_OREFLAG(&huart1);
 		__HAL_UART_CLEAR_NEFLAG(&huart1);
 		__HAL_UART_CLEAR_FEFLAG(&huart1);
 		HAL_UARTEx_ReceiveToIdle_IT(&huart1, bt_byte, sizeof(bt_byte));
 	}
 }
+/* On a UART error, reception stops - restart it so the car keeps listening */
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
   if (huart->Instance == USART1)

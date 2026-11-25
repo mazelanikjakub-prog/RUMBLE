@@ -1,4 +1,15 @@
-"""Headless Bluetooth SPP RC controller (COM8 @ 9600) matching app.py logic."""
+"""Gamepad -> car controller over Bluetooth serial (COM8 @ 9600 baud), no window.
+
+Controls (Xbox pad):
+  RT / LT        forward / backward (throttle)
+  left stick X   steering
+  A              horn (buzzer on the car while held)
+  B              emergency stop (all motors 0)
+The gamepad rumbles while the car reports an obstacle closer than 20 cm ("CLOSE").
+
+Packet sent to the car (6 bytes):  'y' <right motor>  'x' <left motor>  'h' <A button>
+Motor speeds are -127..127, encoded as one byte by encode_axis().
+"""
 
 import os
 import threading
@@ -10,15 +21,18 @@ os.environ["SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS"] = "1"
 import pygame
 import serial
 
+# Stop packet: both motors 0, horn off
 ZERO_PACKET = b"\x79\x00\x78\x00\x68\x00"
 
 
 def encode_axis(value: float) -> int:
+    """Speed -127..127 -> one byte: 0..127 stays, negative -v becomes 127 + v (128..254)."""
     c = max(-127, min(127, int(round(value))))
     return c if c >= 0 else 127 + abs(c)
 
 
 def apply_deadzone(value: float, deadzone: float = 0.12) -> float:
+    """Stick axis -1..1: ignore small movements near the centre, rescale the rest to -1..1."""
     if abs(value) <= deadzone:
         return 0.0
     scaled = min(1.0, (abs(value) - deadzone) / (1.0 - deadzone))
@@ -26,6 +40,7 @@ def apply_deadzone(value: float, deadzone: float = 0.12) -> float:
 
 
 def apply_trigger_deadzone(raw_value: float, deadzone: float = 0.05) -> float:
+    """Trigger axis (-1 released .. 1 pressed) -> 0..1 with a small dead zone."""
     norm = max(0.0, min(1.0, (raw_value + 1.0) * 0.5))
     return 0.0 if norm <= deadzone else min(1.0, (norm - deadzone) / (1.0 - deadzone))
 
@@ -62,6 +77,7 @@ def main() -> None:
     else:
         print("Pad not connected", flush=True)
 
+    # Bluetooth serial port of the car. Windows: COM port of the paired module; Linux: e.g. /dev/rfcomm0
     try:
         ser = serial.Serial("COM8", 9600, timeout=0.1, write_timeout=0.5)
         time.sleep(1.2)
@@ -78,6 +94,7 @@ def main() -> None:
     running, prox_close = True, False
     io_lock, tx_cond, tx_slot = threading.Lock(), threading.Condition(), [None]
 
+    # Background thread: read status lines from the car ("CLOSE" / "CLEAR" = obstacle < 20 cm or not)
     def reader_loop() -> None:
         nonlocal running, prox_close
         buf = ""
@@ -101,6 +118,7 @@ def main() -> None:
             with tx_cond:
                 tx_cond.notify_all()
 
+    # Background thread: send the newest packet (only the latest one waits in tx_slot)
     def writer_loop() -> None:
         nonlocal running
         while running and ser.is_open:
@@ -126,6 +144,7 @@ def main() -> None:
     last_tx, pending, prev_prox, last_rumble = 0.0, False, False, 0.0
     clock = pygame.time.Clock()
 
+    # Queue a packet for sending; skipped if it is identical to the last one (unless force=True)
     def transmit(y: int, x: int, a: int, force: bool = False) -> None:
         nonlocal last_sent, last_tx, pending
         pkt = bytes([0x79, encode_axis(y), 0x78, encode_axis(x), 0x68, 1 if a else 0])
@@ -180,6 +199,8 @@ def main() -> None:
                 lt = apply_trigger_deadzone(raw_lt) if lt_seen else 0.0
                 rt = apply_trigger_deadzone(raw_rt) if rt_seen else 0.0
 
+                # Mix throttle and steering into left/right motor speeds (tank-style drive),
+                # scale down so neither exceeds 1, then to -127..127. Sent as (right, left) = (y, x).
                 throttle, steer = rt - lt, apply_deadzone(raw_x)
                 left_m, right_m = throttle + steer, throttle - steer
                 scale = max(1.0, abs(left_m), abs(right_m))
@@ -190,6 +211,7 @@ def main() -> None:
                 axes_changed = new_axes != last_axes
                 last_axes = new_axes
 
+                # Send at most every 62.5 ms (16/s) while moving; A button and stopping go out immediately
                 if a_changed or (axes_changed and new_axes == (0, 0)):
                     transmit(last_axes[0], last_axes[1], cur_a)
                 elif axes_changed:
@@ -201,6 +223,7 @@ def main() -> None:
             if pending and time.monotonic() - last_tx >= 0.0625:
                 transmit(last_axes[0], last_axes[1], cur_a)
 
+            # Rumble the gamepad while the car reports an obstacle
             now = time.monotonic()
             if prox_close and joy is not None and (not prev_prox or now - last_rumble >= 0.35):
                 last_rumble = now
