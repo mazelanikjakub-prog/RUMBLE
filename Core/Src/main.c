@@ -58,15 +58,19 @@ UART_HandleTypeDef huart2;
  * The PC (pc_controller/fin.py) sends a 6-byte packet over Bluetooth (USART1, 9600 baud)
  * every time the gamepad changes:
  *
- *     'y' <stick Y>  'x' <stick X>  'h' <horn>
+ *     'y' <throttle>  'x' <steering>  'h' <horn>
  *     0x79  byte 1   0x78  byte 3   0x68  byte 5
  *
- * Y and X are the raw left stick of the gamepad, -127..127 (Y: forward = +, X: right = +):
+ * Y = throttle, X = steering, both -127..127 (Y: forward = +, reverse = -; X: right = +):
  *     0..127   -> positive, value as is
  *     128..254 -> negative, -(value - 127)   (so 128 = -1, 254 = -127)
  *
- * Drive (arcade mixing, in the USART1 callback):  left = Y + X,  right = Y - X,
- * each clamped to -127..127; stick inside a small circle around the centre = stop.
+ * Drive (car-style, in the USART1 callback): the outer wheel gets the throttle, the inner wheel
+ * slows down in proportion to the steering (full lock = inner wheel stops, never reverses):
+ *     X > 0 (right):  left = Y,                    right = Y * (127 - X) / 127
+ *     X < 0 (left):   left = Y * (127 + X) / 127,  right = Y
+ * No throttle = no movement. Dead zones, sensitivity and the minimum speed are applied on the PC,
+ * so tuning never needs a re-flash.
  * Horn byte: 1 while the gamepad A button is held, else 0.
  *
  * Everything runs in interrupt callbacks (bottom of this file):
@@ -78,8 +82,8 @@ UART_HandleTypeDef huart2;
  */
 
 /* Values from the last Bluetooth packet (written in the USART1 interrupt) */
-volatile int y = 0;          // left stick Y, -127..127 (forward = +)
-volatile int x = 0;          // left stick X, -127..127 (right = +)
+volatile int y = 0;          // throttle, -127..127 (forward = +, reverse = -)
+volatile int x = 0;          // steering, -127..127 (right = +)
 volatile int h = 0;          // horn: 1 = A button held -> buzzer on
 uint8_t bt_byte[64];         // receive buffer for the Bluetooth UART
 
@@ -742,6 +746,7 @@ void SetSpeedRight(int speed)
 		HAL_GPIO_WritePin(IN1_GPIO_Port, IN1_Pin, GPIO_PIN_RESET);
 		HAL_GPIO_WritePin(IN2_GPIO_Port, IN2_Pin, GPIO_PIN_SET);
 	}
+
 	else
 	{
 		HAL_GPIO_WritePin(IN1_GPIO_Port, IN1_Pin, GPIO_PIN_RESET);
@@ -764,6 +769,7 @@ void SetSpeedLeft(int speed)
 		HAL_GPIO_WritePin(IN3_GPIO_Port, IN3_Pin, GPIO_PIN_RESET);
 		HAL_GPIO_WritePin(IN4_GPIO_Port, IN4_Pin, GPIO_PIN_SET);
 	}
+
 	else
 	{
 		HAL_GPIO_WritePin(IN3_GPIO_Port, IN3_Pin, GPIO_PIN_RESET);
@@ -778,9 +784,8 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 {
 	if (huart->Instance == USART1)
 	{
-		char debug_msg[128];
 
-		// Decode the 6-byte packet  'y' R 'x' L 'h' A  (see the overview at the top)
+		// Decode the 6-byte packet  'y' throttle 'x' steering 'h' horn  (see the overview at the top)
 		// Bytes 128..254 are negative speeds: -(value - 127)
 		if (Size >= 6 && bt_byte[0] == 'y')
 		{
@@ -806,19 +811,31 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 			h = bt_byte[5];
 		}
 
-		// Arcade drive: stick Y = forward/back, stick X = turn.
-		// Pushing right (X > 0) speeds up the left wheel and slows the right one -> turns right.
-		int left = 0, right = 0;
-		if (x * x + y * y >= 25)          // dead zone: stick within radius 5 of the centre = stop
-		{
-			left  = Clamp_Speed(y + x);
-			right = Clamp_Speed(y - x);
+		// Car-style drive: Y = throttle, X = steering. The outer wheel keeps the throttle, the
+		// inner wheel slows down in proportion to X (full lock = it stops, it never reverses).
+		// No dead zone here: the PC (fin.py) already sends exactly 0 while the stick is centred.
+		int left  = Clamp_Speed(y);
+		int right = Clamp_Speed(y);
+		if(y==0){
+			right = (6*x)/10;
+			left = -(6*x)/10;
+
 		}
+		else if (x > 0)          // steer right: slow the right wheel
+		{
+		    right = y * (127 - x) / 127;
+		}
+		else if (x < 0)     // steer left: slow the left wheel
+		{
+		    left = y * (127 + x) / 127;
+		}
+
+
 		SetSpeedRight(right);
 		SetSpeedLeft(left);
 
-		// Reversing = both wheels turn backwards
-		uint8_t new_reversing = (left < 0 && right < 0) ? 1 : 0;
+		// Reversing = negative throttle (the inner wheel can be 0 at full lock, so check Y, not the wheels)
+		uint8_t new_reversing = (-y< 0) ? 1 : 0;
 		if (new_reversing && !is_reversing)
 		{
 			// Reversing just started: lights and buzzer on immediately for the first period
@@ -837,16 +854,13 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 
 		new_bt_ready = 1;
 
-		// Readable debug text for the USB console (USART2) - currently disabled, the main loop prints instead
-		int len = snprintf(debug_msg, sizeof(debug_msg),
-				"Received (%d B): [%02X %02X %02X %02X %02X %02X] -> Y=%d, X=%d\r\n",
-				Size, bt_byte[0], bt_byte[1], bt_byte[2], bt_byte[3], bt_byte[4], bt_byte[5], y, x);
-		//HAL_UART_Transmit(&huart2, (uint8_t*)debug_msg, len, 100);
 		// Clear UART error flags (overrun, noise, framing) and start receiving the next packet
 		__HAL_UART_CLEAR_OREFLAG(&huart1);
 		__HAL_UART_CLEAR_NEFLAG(&huart1);
 		__HAL_UART_CLEAR_FEFLAG(&huart1);
 		HAL_UARTEx_ReceiveToIdle_IT(&huart1, bt_byte, sizeof(bt_byte));
+
+
 	}
 }
 /* On a UART error, reception stops - restart it so the car keeps listening */
